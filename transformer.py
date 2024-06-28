@@ -1,3 +1,9 @@
+# -*- coding: UTF-8 -*-
+"""
+使用Transformer实现简单的德语=>英语翻译
+author: frank_mo@icloud.com
+"""
+import logging
 import math
 import torch
 import numpy as np
@@ -6,10 +12,17 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
 
+logging.basicConfig(level=logging.DEBUG, 
+    format="%(levelname)s: %(asctime)s: %(filename)s:%(lineno)d * %(thread)d %(message)s", 
+    datefmt="%m-%d %H:%M:%S")
+
 # configs
-device = "cuda"
+device = "cpu"
 epochs = 100
 
+# 这里构造的数据考虑了最简单的一种情况：句子长度都是一致的，不需要paddding
+# 如果用到了padding，要保证padding token对应的embedding不能接收回传梯度
+# 做法通常是用注意力mask掉padding对应的位置。比如使用softmax生成注意力权重，那么就给屏蔽位置赋值-INF
 # dataset
 sentences = [
     # enc_input, dec_input, dec_output
@@ -30,17 +43,59 @@ tgt_vocab_size = len(tgt_vocab)
 src_len = 5
 tgt_len = 6
 
-# Transformer Parameters
+# Transformer hyper-parameters
 d_model = 512   # embedding size, token & position
 d_ff = 2048     # FFN dimension，线性层用来做特征提取
 d_k = d_v = 64  # K, Q维度需要相等，为了方便，可以让V的维度也相等
 n_layers = 6    # number of encoder & decoder blocks
 n_heads = 8
 
+# 【计算时间复杂度】
+# 一般来说，d_q = d_k = d_v = d_model / n_heads
+# 除了一些诸如早期ernie的奇葩实现，都会保证d_model % n_heads == 0整除
+# 这里考虑下Transformer的计算时间复杂度，根据模块层次来思考
+# 1) 多头注意力部分
+#   如果全部使用d_model表示，不存在多余的n_heads系数，都会被刚好约分
+#   Q、K、V的线性变换是O(seq_len * d_model ^ 2)
+#   自注意力 O(seq_len ^ 2 * d_model)
+#   最后的输出线性变换：O(seq_len * d_model ^ 2)
+#   综合而言，即O(seq_len ^ 2 * d_model + 2 * seq_len * d ^ 2)。
+#   如果假设max_seq_len约等于隐层维度，再忽略常系数，这块的复杂度可以速记成O(n^3)
+# 2) FFN
+#   两次FFN变换，d_model = > d_ff，再 d_ff => d_model，时间复杂度O(seq_len * d_model * d_ff)
+#   合计是O(2 * seq_len * d_model * d_ff)，速记也大概是O(n^3)
+# 3) enc-dec交叉注意力部分
+#   O(seq_len ^ 2 * d_model)
+# 综合起来，一个encoder layer/decoder layer的时间复杂度就是
+#   O(seq_len ^ 2 * d_model + 2 * seq_len * d_model ^ 2 + 2 * seq_len * d_model * d_ff)
+#   要稍微注意一点是，encoder和decoder的seq_len可以不同，在这个代码里对应src_len和tgt_len。
+#   上面认为src_len == tgt_len == seq_len简化了计算
+#   另外，一般d_ff >> d_model，一般也有d_ff >> seq_len，所以可以速记一个enc/dec layer的上限是O(d_ff ^ 3)
+# 最后，看堆叠了多少个layer，再乘以堆叠数。一个完整的Transformer复杂度可以近似为O(layer_num * seq_len * d_model * d_ff)
 
-# 数据构建
+# 【模型参数量】
+# 如果全用d_model表示，公式中也没有n_heads这个系数，都能刚好约分掉
+# 1) 多头自注意力部分
+#   Q、K、V三组变换，参数量 3 * d_model * d_model，输出还有一组变换 d_model * d_model。
+#   总计 4 * d_model * d_model
+#   注意力层本身只有计算，没有可学习参数，所以参数量与序列长度无关
+# 2) FFN
+#   d_model * d_ff + d_ff * d_model
+# 3) 解码器的交叉注意力
+#   和多头自注意力一样的参数量，4 * d_model * d_model
+# 综合一下
+#   每个encoder layer的参数量为 4 * d_model ^ 2 + 2 * d_model * d_ff
+#   每个decoder layer的参数量为 2 * 4 * d_model ^ 2 + 2 * d_model * d_ff
+#   最后再乘以encoder和decoder堆叠的层数
+
+
+# ******************** 数据处理相关 ********************
+
 def make_data(sentences):
-    """ make data """
+    """ 
+    make data 
+    输入数据是tokens明文，先经过一个词表映射成数值，然后转换成shape为[batch_size, seq_len]形状的tensor
+    """
     enc_inputs, dec_inputs, dec_outputs = [], [], []
     for i in range(len(sentences)):
         enc_input = [[src_vocab[n] for n in sentences[i][0].split()]]
@@ -52,15 +107,17 @@ def make_data(sentences):
         dec_outputs.extend(dec_output)
     return torch.LongTensor(enc_inputs), torch.LongTensor(dec_inputs), torch.LongTensor(dec_outputs)
 
-
 enc_inputs, dec_inputs, dec_outputs = make_data(sentences)
-print(enc_inputs)
-print(dec_inputs)
-print(dec_outputs)
+logging.debug(enc_inputs.shape)
+logging.debug(dec_inputs.shape)
+logging.debug(dec_outputs.shape)
 
 
 class MyDataSet(data.Dataset):
-    """ dataset """
+    """ 
+    dataset 
+    封装成pytorch map-stype数据集
+    """
     def __init__(self, enc_inputs, dec_inputs, dec_outputs):
         """ init """
         super(MyDataSet, self).__init__()
@@ -76,14 +133,23 @@ class MyDataSet(data.Dataset):
         """ get item magic method """
         return self.enc_inputs[idx], self.dec_inputs[idx], self.dec_outputs[idx]
 
-
 loader = data.DataLoader(MyDataSet(enc_inputs, dec_inputs, dec_outputs), 2, True)
 
+# ******************** 数据处理相关 END ********************
+
+
+# ******************** 模型搭建 ********************
 
 def get_attn_pad_mask(seq_q, seq_k):
+    """
+    padding attention mask
+
+    """
     batch_size, len_q = seq_q.size()
     batch_size, len_k = seq_k.size()
-    pad_attn_mask = seq_k.data.eq(0).unsqueeze(1)
+    pad_attn_mask = seq_k.detach().eq(0).unsqueeze(1)
+    # 对于self attention，seq_q == seq_k
+    # 对于enc-dec cross attention，Q由decoder提供，K来自encoder。需要mask掉encoder的pad部分
     return pad_attn_mask.expand(batch_size, len_q, len_k)
 
 
@@ -188,7 +254,6 @@ class PositionalEncoding(nn.Module):
         """ init """
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -216,12 +281,12 @@ class Encoder(nn.Module):
         enc_outputs = self.src_emb(enc_inputs)
         enc_outputs = self.pos_emb(enc_outputs.transpose(0, 1)).transpose(0, 1)
         enc_self_attn_mask = get_attn_pad_mask(enc_inputs, enc_inputs)
+        # enc_self_attn_mask.shape = (batch_size, src_len, src_len)
         enc_self_attns = []
         for layer in self.layers:
             enc_outputs, enc_self_attn = layer(enc_outputs, enc_self_attn_mask)
             enc_self_attns.append(enc_self_attn)
         return enc_outputs, enc_self_attns
-
 
 class Decoder(nn.Module):
     """ decoder """
@@ -237,6 +302,7 @@ class Decoder(nn.Module):
         dec_outputs = self.tgt_emb(dec_inputs)
         dec_outputs = self.pos_emb(dec_outputs.transpose(0, 1)).transpose(0, 1).to(device)
         dec_self_attn_mask = get_attn_pad_mask(dec_inputs, dec_inputs).to(device)
+        # dec_self_attn_mask.shape = (batch_size, tgt_len, tgt_len)
         dec_self_attn_subsequence_mask = get_attn_subsequence_mask(dec_inputs).to(device)
         dec_self_attn_mask = torch.gt((dec_self_attn_mask + dec_self_attn_subsequence_mask), 0).to(device)
 
@@ -245,6 +311,8 @@ class Decoder(nn.Module):
         for layer in self.layers:
             dec_outputs, dec_self_attn, dec_enc_attn = layer(dec_outputs, enc_outputs, dec_self_attn_mask,
                                                              dec_enc_attn_mask)
+            dec_self_attns.append(dec_self_attn)
+            dec_enc_attns.append(dec_enc_attn)
         return dec_outputs, dec_self_attns, dec_enc_attns
 
 
@@ -257,8 +325,20 @@ class Transformer(nn.Module):
         self.projection = nn.Linear(d_model, tgt_vocab_size, bias=False).to(device)
 
     def forward(self, enc_inputs, dec_inputs):
+        # enc_inputs.shape = (batch_size, src_len)
+        # dec_inputs.shape = (batch_size, tgt_len)
+
         enc_outputs, enc_self_attns = self.encoder(enc_inputs)
+        # enc_outputs.shape = (batch_size, src_len, d_model)
+        # enc_self_attns返回值是list，元素个数等于层数，即保存了每层的attention值
+        # enc_self_attns[0].shape = (batch_size, n_heads, src_len, src_len)
+
         dec_outputs, dec_self_attns, dec_enc_attns = self.decoder(dec_inputs, enc_inputs, enc_outputs)
+        logging.debug(dec_enc_attns[0].shape)
+        # dec_outputs.shape = (batch_size, tgt_len, d_model)
+        # dec_self_attns返回值是个list，元素个数等于层数
+        # dec_self_attns.shape = (batch_size, n_head, tgt_len, tgt_len)
+        # dec_enc_attns = (batch_size, n_head, tgt_len, src_len)
         dec_logits = self.projection(dec_outputs)
         return dec_logits.view(-1, dec_logits.size(-1)), enc_self_attns, dec_self_attns, dec_enc_attns
 
@@ -279,17 +359,22 @@ for epoch in range(epochs):
         optimizer.step()
 
 def greedy_decoder(model, enc_input, start_symbol):
+    # 预测的时候要分开调用model.encoder和model.decoder，因为encoder只需要计算一次，decoder需要迭代计算好多次
+    # 在机器翻译场景下，encoder的输入就是原文本
     enc_outputs, enc_self_attns = model.encoder(enc_input)
+    # dec_input.shape = (batch_size, seq_len)。在这里batch_size取1，seq_len一开始为0
     dec_input = torch.zeros(1, 0).type_as(enc_input.data)
     terminal = False
     next_symbol = start_symbol
     while not terminal:
+        # 把上一轮吐出的结果附加到dec_input里
         dec_input = torch.cat([dec_input.to(device),
                                torch.tensor([[next_symbol]], dtype=enc_input.dtype).to(device)], -1)
         dec_outputs, _, _ = model.decoder(dec_input, enc_input, enc_outputs)
+        # 最后这个projection是Transformer的最后一层，别忘记了
         projected = model.projection(dec_outputs)
         prob = projected.squeeze(0).max(dim=-1, keepdim=False)[1]
-        next_word = prob.data[-1]
+        next_word = prob.detach()[-1]
         next_symbol = next_word
         if next_symbol == tgt_vocab["E"]:
             terminal = True
@@ -305,3 +390,5 @@ for i in range(len(enc_inputs)):
     print(enc_inputs[i], '->', greedy_dec_predict.squeeze())
     print([src_idx2word[t.item()] for t in enc_inputs[i]], '->',
           [tgt_idx2word[n.item()] for n in greedy_dec_predict.squeeze()])
+
+
